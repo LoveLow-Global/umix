@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>um!x alpha</title>
+<meta name="description" content="um!x alpha puts your music and visual taste on one map, with film and TV picks from a multi-layer graph neural network.">
+<!-- Which engine runs the model. "auto" asks the Julia API first and falls back to the browser.
+     On a static host like Vercel use "browser" (skips the API check), or keep "auto" and put the
+     address of a hosted Julia server in umix-api. A ?engine= link or the facilitator panel overrides this. -->
+<meta name="umix-engine" content="auto">
+<meta name="umix-api" content="">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<button class="reset glass" id="resetBtn" data-act="hardreset" aria-label="Reset the prototype to the start"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.6"/><path d="M4 4v4.6h4.6"/></svg><span>Reset prototype</span></button>
+
+<div class="stage">
+  <div class="phone" id="phone">
+    <div class="island" aria-hidden="true"></div>
+    <div id="screen"><div class="boot"><p class="sub">Loading the taste model…</p></div></div>
+    <div id="sheetWrap" hidden></div>
+    <div id="menuWrap" hidden></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <div class="homebar" aria-hidden="true"></div>
+  </div>
+</div>
+
+<aside class="wiz" id="wiz" hidden aria-label="Facilitator controls">
+  <button class="x" data-act="wz-close" aria-label="Close facilitator panel">×</button>
+  <h3>Facilitator</h3>
+  <p>Open or close with the <b>`</b> key, or tap the flower logo three times.</p>
+  <div class="k">Engine</div>
+  <div class="eng" id="wzEngine">Loading…</div>
+  <div class="grp">
+    <button data-act="wz-engine" data-v="auto">Auto</button>
+    <button data-act="wz-engine" data-v="julia">Julia API</button>
+    <button data-act="wz-engine" data-v="browser">In the browser</button>
+  </div>
+  <div class="k">Jump to</div>
+  <div class="grp">
+    <button data-act="wz-jump" data-to="welcome">Welcome</button>
+    <button data-act="wz-jump" data-to="connect">Accounts</button>
+    <button data-act="wz-jump" data-to="quiz">Questions</button>
+    <button data-act="wz-jump" data-to="board">Map</button>
+    <button data-act="wz-jump" data-to="discover">Discover</button>
+    <button data-act="wz-jump" data-to="settings">Settings</button>
+  </div>
+  <div class="grp">
+    <button data-act="wz-undismiss">Bring back skipped</button>
+    <button data-act="wz-tutorial">Show map tutorial</button>
+    <button data-act="wz-reset">Reset prototype</button>
+  </div>
+</aside>
+
+<noscript><p style="padding:24px">um!x needs JavaScript to run.</p></noscript>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
