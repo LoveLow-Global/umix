@@ -1,0 +1,44 @@
+amazon: 110232 people (88186 train, 11023 val, 11023 test)
+  music    7151 items (+15000 search only),   196 tags,   426957 saves by  46858 people, 9.1 each
+  film    21188 items (+15000 search only),    23 tags,  1018365 saves by  94817 people, 10.7 each
+  style   22012 items (+15000 search only),  2789 tags,   687620 saves by  88995 people, 7.7 each
+  layers per person: film+style 63374, music+film 21237, music+style 15415, music+film+style 10206
+training Multi-layer GCN (ours) with ModelConfig(64, 2, 32, true), 88186 training people, enzyme
+epoch   1  loss 8.7458  (32 steps, 44 s)
+          val ndcg@10 0.0417
+epoch   2  loss 8.6247  (32 steps, 50 s)
+          val ndcg@10 0.0445
+epoch   3  loss 8.5561  (32 steps, 58 s)
+          val ndcg@10 0.0452
+epoch   4  loss 8.4914  (32 steps, 38 s)
+          val ndcg@10 0.0447
+epoch   5  loss 8.4480  (32 steps, 38 s)
+          val ndcg@10 0.0445
+epoch   6  loss 8.3990  (32 steps, 39 s)
+ERROR: LoadError: MethodError: Cannot `convert` an object of type Int64 to an object of type Dict{String, Float64}
+The function `convert` exists, but no method is defined for this combination of argument types.
+
+Closest candidates are:
+  Dict{K, V}(::Any) where {K, V}
+   @ Base dict.jl:90
+  convert(::Type{T}, !Matched::T) where T<:AbstractDict
+   @ Base abstractdict.jl:575
+  convert(::Type{T}, !Matched::AbstractDict) where T<:AbstractDict
+   @ Base abstractdict.jl:577
+  ...
+
+Stacktrace:
+ [1] setindex!(h::Dict{String, Dict{String, Float64}}, v0::Int64, key::String)
+   @ Base ./dict.jl:355
+ [2] top-level scope
+   @ ~/Desktop/fall2026/IID2019/umix/backend/bin/train.jl:66
+ [3] include(mod::Module, _path::String)
+   @ Base ./Base.jl:306
+ [4] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:317
+ [5] _start()
+   @ Base ./client.jl:550
+in expression starting at /Users/lovelow/Desktop/fall2026/IID2019/umix/backend/bin/train.jl:46
+          val ndcg@10 0.0447
+stopping early, best epoch 3
+exit 1

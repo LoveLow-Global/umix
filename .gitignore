@@ -1,8 +1,6 @@
-# big downloads, rebuild them with `make amazon`
+# big downloads and what's built from them, rebuild with `make amazon` and `make data`
 data/raw/
-data/processed/amazon.json
-data/processed/*.log
-models/amazon*.json
+data/processed/
 results/*.log
 
 # raw user test answers from testers, share them directly instead of through git
@@ -13,3 +11,4 @@ results/user_test/
 .vscode/
 node_modules/
 .vercel/
+webpage/dist/

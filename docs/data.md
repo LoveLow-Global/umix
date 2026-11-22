@@ -1,69 +1,67 @@
-# Data
+# The data
 
-## What we needed
+um!x runs on one real dataset, Amazon Reviews 2023 (Hou et al., 2024, McAuley Lab at UC San Diego). Nothing in the app is made up.
 
-For the alpha we want to guess film and TV taste from music taste and visual or fashion taste. To train that, we need the same people's saves in all three. That is the hard part. Lots of datasets have one of these layers, and a few have two, but almost nobody has all three for the same people.
+## Why Amazon
 
-## What I looked at
+We wanted the same people's taste in music, clothes and film. No public dataset has Spotify, Pinterest and Netflix for the same people. Amazon is the closest thing. One reviewer id covers all of a person's reviews, so the same person shows up in
 
-| Dataset | Music | Visual / fashion | Film / TV | Same people across them | Verdict |
-|---|---|---|---|---|---|
-| Amazon Reviews 2023 (McAuley Lab, UCSD) | CDs & Vinyl | Clothing, Shoes & Jewelry | Movies & TV | yes, one reviewer id across categories | **used** |
-| Douban (movie, music, book) | yes | no | yes | yes | no fashion or visual layer |
-| Wiki-MID (Twitter interests mapped to Wikipedia pages) | yes | not that I could find | yes | yes | interests, not saves, and no clear fashion domain |
-| TEDS 18-year questionnaire (UK twins) | yes | 8 fashion styles | no | yes | no film, access needs an application |
-| MovieLens, Spotify Million Playlist, H&M, Polyvore | one each | one each | one each | no | single domain, can't teach cross-domain taste |
+* **music**, the CDs & Vinyl category
+* **style**, the Clothing, Shoes & Jewelry category
+* **film**, the Movies & TV category
 
-So Amazon was the only public option that has all three layers for the same people. It is not perfect (more on that below), but it is real.
+A rating of 4 or 5 stars counts as a save. Lower ratings get dropped.
 
-## The real dataset (Amazon)
+## What we download
 
-`scripts/fetch_amazon.sh` does the downloading. It grabs the small 5-core rating files for music and film (about 21 MB and 111 MB), then streams the fashion ratings (about 400 MB) and only keeps rows for people who already showed up in music and film. It also streams the metadata files and only keeps titles and categories for items those people touched. Nothing huge is stored.
+`scripts/fetch_amazon.sh` (or `make amazon`) streams the files and only keeps what we need, so about 600 MB stays on disk out of about 5 GB streamed.
 
-`backend/bin/prep_amazon.jl` then turns that into a dataset.
+1. The 5-core rating files for music and film, and the style ratings of anyone who also has music or film.
+2. Everyone with ratings in at least two of the three layers. That's 218,584 people.
+3. The metadata of every product those people rated, plus products popular enough on Amazon that someone might search for them. `backend/bin/compact_meta.jl` keeps only the title, brand or artist, category path, genre, director and actors, rating count and the main image id.
 
-* A 4 or 5 star rating counts as "saved". Lower ratings get dropped.
-* Then a dense core, repeated until nothing changes. Every person needs at least 2 music saves, 2 fashion saves and 4 film saves. Every item needs at least 4 people (3 for fashion, because fashion items almost never repeat).
-* Genre tags come from the Amazon category lists, minus stuff about stores, formats and deals.
-* People get split 80 / 10 / 10 into train, validation and test.
+## Products become the things people name
 
-What came out
+People don't think in Amazon products. Nobody says "I love the 2014 remastered CD of 1989". So products get merged (`backend/src/entities.jl`).
+
+| layer | one item is | how | example |
+|---|---|---|---|
+| music | an artist | the artist named on the CD. "Barry, John" becomes "John Barry", "Various Artists" is dropped | Taylor Swift |
+| film | a film or series | DVD, Blu-ray, VHS and streaming editions get merged by title, and seasons fold into their series | Friends, Inception |
+| style | a brand plus a product type | brand and Amazon's category path | Dr. Martens, women's boots |
+
+Some style things are left out because they say little about someone's style. Those are kids' and baby clothes, costumes, novelty print shirts, underwear, socks and sleepwear. Exercise and instructional DVDs are left out of film too.
+
+## Tags come from Amazon's labels
+
+Every item also gets tags from Amazon's own labels, added up over its products. A tag sticks if it's on at least a fifth of them.
+
+* music gets genres from the CDs & Vinyl tree, like Pop, Country or Korean Pop. That's how Taylor Swift ends up tagged Pop and Country without anyone typing it in.
+* film gets one of about 20 genres. Amazon's messy Genre field ("Comedy/Television", "DVD Movie") gets mapped to a short list.
+* style gets the product type, its group, the section (women's, men's) and the brand.
+
+Tags matter for two things. The model uses them next to each item's learned vector, and an item too rare for the graph can still count through its tags.
+
+## Cleaning
+
+A dense core keeps every item with enough fans (10 for music and style, 12 for film) and every person with enough saves in at least two layers (2 artists, 3 titles, 2 style items). It repeats until nothing changes. Then people get split 80/10/10 into train, validation and test.
 
 | | count |
 |---|---|
-| people with 4-5 star ratings in all three layers | 13,087 |
-| people after the dense core | 7,553 (6,043 train, 755 val, 755 test) |
-| albums | 7,796 items, 62,314 saves, 8.3 per person |
-| fashion items | 8,205 items, 45,852 saves, 6.1 per person |
-| films and TV | 15,378 items, 126,032 saves, 16.7 per person |
-| genre tags | 109 |
+| people | 105,526 (84,420 train, 10,553 validation, 10,553 test) |
+| music | 7,087 artists, 420,445 saves |
+| film | 18,153 films and series, 964,007 saves |
+| style | 11,541 brand and type items, 565,306 saves |
+| film and style | 59,548 people |
+| music and film | 21,240 people |
+| music and style | 14,930 people |
+| all three | 9,808 people |
 
-Things to keep in mind
+On top of the graph items, each layer keeps 10,000 search-only items. These are real artists, titles and brands that are too rare in our data for the graph, like newer K-pop acts, ranked by how many ratings they have on Amazon. You can find them during onboarding and they steer your picks through their tags.
 
-* Amazon is about buying stuff, not saving a mood. A CD someone bought for their dad still counts.
-* Fashion is really sparse. Out of about 102K fashion items these people rated, 73K were rated by only one of them.
-* Fashion items have no titles in our copy. The fashion metadata file is about 4 GB. Run `FASHION_META=1 bash scripts/fetch_amazon.sh` if you want them.
-* The data is for research use. Don't put the raw files in the repo (they are in `.gitignore`) and cite Hou et al. (2024) if we report numbers.
+## Limits
 
-## The synthetic maps (for the app)
-
-The real Amazon items are not what the app shows. The app uses a hand-made catalogue with mood tags, like the design prototype. So for the app model we made fake maps on top of that catalogue.
-
-The catalogue is in `data/catalog`, one file per layer, easy to edit.
-
-* `music.txt` has 64 songs
-* `visual.txt` has 62 visual saves (30 images and 32 fashion pieces)
-* `film.txt` has 75 films and series
-* 40 mood tags, the designer's set plus dark, vintage, glam, minimal, cozy, street and nature
-
-`backend/src/synth.jl` makes 5,000 maps. Each map gets
-
-1. a taste mix over 10 archetypes (rainy library, neon night, loud summer and so on), mostly leaning on one or two of them
-2. one hidden "scene". Items have scenes too and a scene reaches across layers, so a scene has its songs, its pictures and its films. Tags never show scenes.
-3. a popularity bump for some items
-
-Then it picks songs, visual saves and films that score high on all of that, with some randomness.
-
-Why the hidden scenes? Without them, matching tags would explain everything and a graph model would have nothing to learn. With them, the only way to get the scene right is to notice what gets saved together, which is the whole point of the social computing idea in the poster (co-saves as a signal).
-
-Be honest about what this means. Results on synthetic maps show the pipeline works and that the model can pick up co-save patterns. They do not show that real people behave like this. When um!x has real saves from the user test, those should replace the fake maps. `make_synthetic` and `load_amazon` both return the same `Dataset` shape, so a loader for real um!x saves just needs to do the same.
+* Amazon buyers aren't Spotify listeners. CD buyers skew older, so classic rock is very big and newer artists are rare.
+* A purchase isn't the same as taste. People buy gifts, and they buy basics.
+* Amazon has no age or gender, so the model can't use either. Style items do carry their women's or men's section, which the app uses to filter style picks.
+* Covers and product photos load from Amazon's image links. That's fine for a class prototype, a real launch would need permission.

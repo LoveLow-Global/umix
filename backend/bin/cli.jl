@@ -1,4 +1,4 @@
-# Tiny helpers shared by the scripts in bin/. Arguments look like  --dim 32 --hops 2 --flag
+# Tiny helpers shared by the scripts in bin/. Arguments look like  --dim 64 --hops 2 --flag
 
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
@@ -27,3 +27,12 @@ end
 argint(o, k, d) = haskey(o, k) ? parse(Int, o[k]) : d
 argfloat(o, k, d) = haskey(o, k) ? parse(Float64, o[k]) : d
 argflag(o, k) = get(o, k, "false") == "true"
+
+"writes to two places at once, like the screen and a log file"
+struct Tee <: IO
+    a::IO
+    b::IO
+end
+Base.write(t::Tee, x::UInt8) = (write(t.a, x); write(t.b, x))
+Base.unsafe_write(t::Tee, p::Ptr{UInt8}, n::UInt) = (unsafe_write(t.a, p, n); unsafe_write(t.b, p, n))
+Base.flush(t::Tee) = (flush(t.a); flush(t.b))

@@ -1,84 +1,110 @@
-# Training with the hidden-film setup.
+# Training with the hidden-layer setup, which copies what the app does.
 #
-# The app always meets NEW people: someone shows up with songs and pictures, and we have
-# to guess films without them being in the graph. So training copies that. Each epoch the
-# training users get cut into `folds` parts. One part at a time plays "new users": they
-# are kept out of the graph, their music + visual saves go through the user tower, and
-# their films are the answers. The other parts make the graph. Without this, a user's
-# own films would leak into the item vectors through the graph and the model would cheat.
+# Every epoch, the training people get split into folds. The people of one fold play new users.
+# They stay out of the graph, and for each of them one layer gets hidden (sometimes only half of
+# it), and the model has to find the hidden saves from what's left. The other folds build the graph.
 
 Base.@kwdef struct TrainConfig
-    epochs::Int = 150
-    lr::Float64 = 0.02
-    weight_decay::Float64 = 3e-3
-    batch::Int = 256
+    epochs::Int = 30
+    lr::Float64 = 0.005
+    weight_decay::Float64 = 1e-4
+    batch::Int = 1024          # people per target layer in one step
     folds::Int = 4
-    item_drop::Float64 = 0.3    # hide some saves of the "new users" so small maps work too
-    eval_every::Int = 5
-    patience::Int = 6           # stop after this many checks without a better val score
-    pop_init::Bool = true       # start the film bias at log popularity
+    warm::Float64 = 0.3        # share of cases that keep half of the target layer as input
+    drop::Float64 = 0.2        # each input is dropped with this chance
+    tagonly::Float64 = 0.15    # each input is shown only through its tags with this chance
+    eval_every::Int = 1
+    patience::Int = 3
+    val_people::Int = 4000
     seed::Int = 1
+    backend::Symbol = :enzyme  # or :mooncake
 end
+
+"A trained model: the network, its weights, and the graph of all training people."
+struct Model
+    net::UmixNet
+    ps::Any
+    graph::Graph
+    cfg::ModelConfig
+    name::String
+    epoch::Int
+end
+item_vectors(m::Model) = item_vectors(m.net, m.ps, m.graph)
+
+autodiff_backend(b::Symbol) = b == :enzyme ? AutoEnzyme() : b == :mooncake ? AutoMooncake(; config = nothing) : error("unknown backend $b")
 
 """
     train(ds, mcfg, tcfg; name, log) -> Model
 
-Keeps the parameters with the best validation NDCG@10.
+Fits the network on the training people and keeps the weights with the best NDCG@10 on the
+validation people.
 """
 function train(ds::Dataset, mcfg::ModelConfig = ModelConfig(), tcfg::TrainConfig = TrainConfig();
-               name = "mlgcn", log = println)
-    rng = MersenneTwister(tcfg.seed)
-    θ = init_params(rng, ds, mcfg)
-    if tcfg.pop_init
-        # start the film bias at log popularity, so the model begins as "popular films"
-        # and only has to learn what is personal on top of that
-        p = Base.log.(film_popularity(ds) .+ 1f0)   # `log` here is the printer keyword
-        θ.bf .= p .- sum(p) / length(p)
-    end
-    X = tag_features(ds)
-    opt = Optimisers.setup(Optimisers.AdamW(tcfg.lr, (0.9, 0.999), tcfg.weight_decay), θ)
+               name = "Multi-layer GCN (ours)", log = stdout)
+    rng = Xoshiro(tcfg.seed)
+    net = UmixNet(ds, mcfg)
+    ps, st = Lux.setup(rng, net)
     tr = users_in(ds, :train)
-    va = users_in(ds, :val)
+    for l in LAYERS   # start every item's bias at its (centered) log popularity
+        p = Base.log.(fans(ds, l, tr) .+ 1f0)
+        ps.bias[l] .= p .- mean(p)
+    end
+    ts = Lux.Training.TrainState(net, ps, st, AdamW(tcfg.lr, (0.9, 0.999), tcfg.weight_decay))
+    ad = autodiff_backend(tcfg.backend)
     full = build_graph(ds, tr)
-    best = (score = -Inf, θ = deepcopy(θ), epoch = 0)
-    bad = 0
-    history = Dict{String,Any}[]
-    for ep in 1:tcfg.epochs
-        t0 = time()
-        perm = shuffle(rng, tr)
-        parts = [perm[k:tcfg.folds:end] for k in 1:tcfg.folds]
-        total, nb = 0.0, 0
-        for k in 1:tcfg.folds
-            graph_users = reduce(vcat, [parts[j] for j in 1:tcfg.folds if j != k])
-            g = build_graph(ds, graph_users)
-            for b in Iterators.partition(shuffle(rng, parts[k]), tcfg.batch)
-                M, mask = source_input(ds, b; drop = tcfg.item_drop, rng)
-                Y = target_matrix(ds, b)
-                l, gr = Zygote.withgradient(p -> batch_loss(p, X, g, M, mask, Y, mcfg), θ)
-                opt, θ = Optimisers.update!(opt, θ, gr[1])
-                total += l
-                nb += 1
+    val = users_in(ds, :val)
+    val = val[1:min(end, tcfg.val_people)]
+    best, best_ps, best_epoch, bad = -Inf, deepcopy(ts.parameters), 0, 0
+    println(log, "training $name with $mcfg, $(length(tr)) training people, $(tcfg.backend)")
+    for epoch in 1:tcfg.epochs
+        t0, tot, steps = time(), 0.0, 0
+        order = shuffle(rng, tr)
+        folds = [order[f:tcfg.folds:end] for f in 1:tcfg.folds]
+        for f in 1:tcfg.folds
+            g = build_graph(ds, reduce(vcat, folds[[k for k in 1:tcfg.folds if k != f]]))
+            for chunk in Iterators.partition(folds[f], 3 * tcfg.batch)
+                cases = Dict(l => Tuple{Dict{Symbol,Vector{Tuple{Int,Bool}}},Vector{Int}}[] for l in LAYERS)
+                for u in chunk
+                    t = rand(rng, layers_of(ds, u))
+                    warm = rand(rng) < tcfg.warm && length(ds.inter[t][u]) >= 4
+                    push!(cases[t], person_case(ds, u, t, rng; cross = !warm, drop = tcfg.drop, tagonly = tcfg.tagonly))
+                end
+                x = (graph = g, music = make_sub(net, ds, cases[:music], :music), film = make_sub(net, ds, cases[:film], :film),
+                     style = make_sub(net, ds, cases[:style], :style))
+                _, loss, _, ts = Lux.Training.single_train_step!(ad, batch_loss, x, ts)
+                tot += loss
+                steps += 1
             end
         end
-        rec = Dict{String,Any}("epoch" => ep, "loss" => total / nb, "seconds" => time() - t0)
-        if ep % tcfg.eval_every == 0 || ep == tcfg.epochs
-            emb = item_embeddings(θ, X, full, mcfg)
-            m = Model(name, mcfg, θ, emb, ds.items, ds.tags, history)
-            val = evaluate(ScoreModel(m), ds, va)
-            rec["val_ndcg@10"] = val["ndcg@10"]
-            rec["val_recall@10"] = val["recall@10"]
-            if val["ndcg@10"] > best.score
-                best = (score = val["ndcg@10"], θ = deepcopy(θ), epoch = ep)
-                bad = 0
+        @printf(log, "epoch %3d  loss %.4f  (%d steps, %.0f s)\n", epoch, tot / max(steps, 1), steps, time() - t0)
+        flush(log)
+        if epoch % tcfg.eval_every == 0 || epoch == tcfg.epochs
+            score = val_ndcg(net, ts.parameters, ds, full, val)
+            @printf(log, "          val ndcg@10 %.4f\n", score)
+            if score > best
+                best, best_ps, best_epoch, bad = score, deepcopy(ts.parameters), epoch, 0
             else
                 bad += 1
+                bad >= tcfg.patience && (println(log, "stopping early, best epoch $best_epoch"); break)
             end
-            w = layer_weights(θ)
-            log(@sprintf("  epoch %3d  loss %.4f  val ndcg@10 %.4f  recall@10 %.4f  layers m/v/f %.2f/%.2f/%.2f  (%.1fs)",
-                ep, rec["loss"], val["ndcg@10"], val["recall@10"], w[1], w[2], w[3], rec["seconds"]))
         end
-        push!(history, rec)
-        bad >= tcfg.patience && (log("  stopping early, best epoch was $(best.epoch)"); break)
     end
-    return finalize_model(name, best.θ, ds, mcfg, history)
+    Model(net, best_ps, full, mcfg, name, best_epoch)
+end
+
+"mean NDCG@10 over every (person, hidden layer) case of `people`"
+function val_ndcg(net::UmixNet, ps, ds::Dataset, g::Graph, people)
+    Z = item_vectors(net, ps, g)
+    tot, n = 0.0, 0
+    for t in LAYERS
+        cases = hidden_layer_cases(ds, people, t)
+        for part in Iterators.partition(cases, 2048)
+            S = sub_scores(net, ps, Z, make_sub(net, ds, [(c.given, c.hidden) for c in part], t), t)
+            for (b, c) in enumerate(part)
+                tot += ndcg_at(view(S, :, b), c.hidden, 10)
+                n += 1
+            end
+        end
+    end
+    tot / max(n, 1)
 end

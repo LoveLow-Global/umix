@@ -1,45 +1,38 @@
-// Checks that the browser engine gives the same answers as the Julia engine for the maps in
-// backend/test/parity_fixture.json. It checks both copies of the engine, the one the plain
-// app uses (frontend/js/engine.js) and the one the React site uses (webpage/src/engine.js).
+// Checks that the browser engine (webpage/src/lib/engine.js) gives the same picks as the Julia
+// version for the cases in backend/test/parity_fixture.json.
 //   julia --project=backend backend/bin/parity_fixture.jl
 //   node scripts/check_parity.mjs
-import { existsSync, readFileSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { LAYERS, prepare, recommend } from '../webpage/src/lib/engine.js'
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const fixture = JSON.parse(readFileSync(join(root, 'backend/test/parity_fixture.json'), 'utf8'));
-const modelJSON = JSON.parse(readFileSync(join(root, fixture.model), 'utf8'));
-const engines = ['frontend/js/engine.js', 'webpage/src/engine.js'].filter(p => existsSync(join(root, p)));
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const fixture = JSON.parse(readFileSync(join(root, 'backend/test/parity_fixture.json'), 'utf8'))
+const dir = resolve(root, fixture.model)
+const json = f => JSON.parse(readFileSync(join(dir, f), 'utf8'))
+const manifest = json('manifest.json')
+const catalogs = Object.fromEntries(LAYERS.map(l => [l, json(manifest.catalog[l])]))
+const buf = readFileSync(join(dir, manifest.vectors.file))
+const m = prepare(manifest, catalogs, json(manifest.search), buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
 
-let failed = false;
-for (const file of engines) {
-  const { prepareModel, recommend } = await import(pathToFileURL(join(root, file)).href);
-  const model = prepareModel(structuredClone(modelJSON));
-  let bad = 0, picks = 0;
-  for (const [n, c] of fixture.cases.entries()) {
-    const js = recommend(model, c.items, { k: c.k, exclude: c.exclude });
-    const jl = c.julia;
-    const problems = [];
-    if (js.recs.length !== jl.recs.length) problems.push(`length ${js.recs.length} vs ${jl.recs.length}`);
-    js.recs.forEach((r, i) => {
-      const o = jl.recs[i];
-      if (!o) return;
-      picks++;
-      if (r.id !== o.id) problems.push(`rank ${i + 1}: ${r.id} vs ${o.id}`);
-      else {
-        if (Math.abs(r.score - o.score) > 2e-4) problems.push(`${r.id} score ${r.score} vs ${o.score}`);
-        if (Math.abs(r.match - o.match) > 2e-3) problems.push(`${r.id} match ${r.match} vs ${o.match}`);
-        if (r.because !== o.because) problems.push(`${r.id} because ${r.because} vs ${o.because}`);
-      }
-    });
-    for (const k of ['music', 'visual']) {
-      if (Math.abs(js.weights[k] - jl.weights[k]) > 2e-3) problems.push(`weight ${k} ${js.weights[k]} vs ${jl.weights[k]}`);
-      if (js.used[k] !== jl.used[k]) problems.push(`used ${k} ${js.used[k]} vs ${jl.used[k]}`);
-    }
-    if (problems.length) { bad++; console.log(`${file} case ${n}: ${problems.slice(0, 4).join('; ')}`); }
-  }
-  console.log(`${file}: ${fixture.cases.length - bad} of ${fixture.cases.length} maps match (${picks} picks compared)`);
-  if (bad) failed = true;
-}
-process.exit(failed ? 1 : 0);
+let bad = 0, picks = 0
+fixture.cases.forEach((c, n) => {
+  const r = recommend(m, c.inputs, { layer: c.layer, k: c.k, exclude: new Set(c.exclude) })
+  const problems = []
+  if (r.picks.length !== c.picks.length) problems.push(`length ${r.picks.length} vs ${c.picks.length}`)
+  r.picks.forEach((p, i) => {
+    const o = c.picks[i]
+    if (!o) return
+    picks++
+    if (p.i !== o.i) return problems.push(`rank ${i + 1}: ${p.i} vs ${o.i}`)
+    if (Math.abs(p.score - o.score) > 1e-6 * Math.max(1, Math.abs(o.score))) problems.push(`item ${p.i} score ${p.score} vs ${o.score}`)
+    if (Math.abs(p.match - o.match) > 1e-6) problems.push(`item ${p.i} match ${p.match} vs ${o.match}`)
+    const a = p.because ? `${p.because.layer}/${p.because.n}` : 'none', b = o.because ? `${o.because.layer}/${o.because.n}` : 'none'
+    if (a !== b) problems.push(`item ${p.i} because ${a} vs ${b}`)
+  })
+  for (const l of LAYERS) if (Math.abs(r.weights[l] - c.weights[l]) > 1e-9) problems.push(`weight ${l} ${r.weights[l]} vs ${c.weights[l]}`)
+  if (problems.length) { bad++; console.log(`case ${n}: ${problems.slice(0, 4).join('; ')}`) }
+})
+console.log(`${fixture.cases.length - bad} of ${fixture.cases.length} cases match (${picks} picks compared)`)
+process.exit(bad ? 1 : 0)

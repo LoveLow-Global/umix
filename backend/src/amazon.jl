@@ -1,24 +1,13 @@
 # Real data: Amazon Reviews 2023 (Hou et al., 2024, McAuley Lab, UCSD).
-# scripts/fetch_amazon.sh already cut it down to people who rated all three of
-#   music   = CDs & Vinyl
-#   visual  = Clothing, Shoes & Jewelry
-#   film/TV = Movies & TV
-# Here a rating of 4 or 5 counts as "saved". Then we keep a dense core so every user
-# has enough saves in each layer and every item is saved by a few people.
+#   music = CDs & Vinyl, film = Movies & TV, style = Clothing, Shoes & Jewelry
+# scripts/fetch_amazon.sh keeps people who rated things in at least two of the three.
+# Here a 4 or 5 star rating counts as a save, products become entities (entities.jl), and a
+# dense core keeps people with enough saves in at least two layers and items with enough fans.
 
-const AMAZON_FILES = (
-    music = ("CDs_and_Vinyl.5core.overlap.csv.gz", "meta_CDs_and_Vinyl.overlap.jsonl.gz"),
-    visual = ("Clothing_Shoes_and_Jewelry.5core.overlap.csv.gz", "meta_Clothing_Shoes_and_Jewelry.overlap.jsonl.gz"),
-    film = ("Movies_and_TV.5core.overlap.csv.gz", "meta_Movies_and_TV.overlap.jsonl.gz"),
-)
-
-# category names that are about stores, formats, prices or deals instead of taste
-const NOISE_WORDS = ["deal", "\$", "featured", "all ", "titles", "studio", "entertainment",
-    "blu-ray", "dvd", "boxed", "general", "independently", "special interests", "new release",
-    "forms & genres", "today", "prime", "fully loaded", "best ", "top ", "cds & vinyl", "movies & tv",
-    "amazon", "home video", "pictures", "warner", "sony", "fox", "paramount", "universal", "mgm",
-    "lionsgate", "bbc", "disney", "hbo", "criterion", "box set", "4k", "collection", "movies", "tv",
-    "central", "edition", "characters & series"]
+const AMAZON_FILES = Dict(
+    :music => ("CDs_and_Vinyl.2plus.csv.gz", "meta_CDs_and_Vinyl.compact.jsonl.gz"),
+    :film => ("Movies_and_TV.2plus.csv.gz", "meta_Movies_and_TV.compact.jsonl.gz"),
+    :style => ("Clothing_Shoes_and_Jewelry.2plus.csv.gz", "meta_Clothing_Shoes_and_Jewelry.compact.jsonl.gz"))
 
 function gz_lines(f::Function, path::AbstractString)
     open(path) do io
@@ -26,144 +15,144 @@ function gz_lines(f::Function, path::AbstractString)
     end
 end
 
-"user => list of item ids with rating >= min_rating"
-function read_ratings(path::AbstractString; min_rating = 4.0)
-    out = Dict{String,Vector{String}}()
+"person => entity keys they saved (4 or 5 stars) in one layer"
+function read_saves(path::AbstractString, products::Dict{String,Product}; min_rating = 4.0)
+    out = Dict{String,Set{String}}()
     gz_lines(path) do lines
-        first = true
+        head = true
         for line in lines
-            first && (first = false; continue)
+            head && (head = false; continue)
             p = split(line, ',')
             length(p) >= 3 || continue
             r = tryparse(Float64, p[3])
             (r === nothing || r < min_rating) && continue
-            push!(get!(out, String(p[1]), String[]), String(p[2]))
+            prod = get(products, p[2], nothing)
+            prod === nothing && continue
+            push!(get!(Set{String}, out, String(p[1])), prod.key)
         end
     end
-    return out
-end
-
-clean_tag(s) = lowercase(strip(replace(s, r"\s+" => " ")))
-is_noise(s) = any(w -> occursin(w, lowercase(s)), NOISE_WORDS) || length(s) > 32 || lowercase(strip(s)) in ("all", "dts", "music")
-
-"asin => (kind, title, by, category list) from a filtered metadata file (if it is there)"
-function read_meta(path::AbstractString, domain::Symbol)
-    meta = Dict{String,Tuple{String,String,String,Vector{String}}}()
-    isfile(path) || return meta
-    gz_lines(path) do lines
-        for line in lines
-            o = JSON3.read(line)
-            asin = String(get(o, :parent_asin, ""))
-            isempty(asin) && continue
-            title = something(get(o, :title, nothing), "")
-            title = title isa AbstractString ? strip(title) : ""
-            cats = [String(c) for c in something(get(o, :categories, nothing), String[]) if c isa AbstractString]
-            feats = [String(x) for x in something(get(o, :features, nothing), String[]) if x isa AbstractString]
-            store = something(get(o, :store, nothing), "")
-            store = store isa AbstractString ? store : ""
-            details = something(get(o, :details, nothing), Dict())
-            kind, by = if domain == :music
-                artist = strip(first(split(store, "Format:")))
-                artist = strip(replace(artist, r"\(.*?\)" => ""))
-                ("Album", isempty(artist) ? "Unknown artist" : artist)
-            elseif domain == :film
-                sub = something(get(o, :subtitle, nothing), "")
-                sub = sub isa AbstractString ? sub : ""
-                tv = occursin("Season", sub) || any(f -> occursin("episode", f), feats)
-                year = something(findfirst(f -> occursin(r"^(19|20)\d\d$", f), feats), 0)
-                director = get(details, :Director, nothing)
-                if director === nothing
-                    ds = get(details, :Directors, nothing)
-                    director = ds isa AbstractVector && !isempty(ds) ? ds[1] : nothing
-                end
-                by = director isa AbstractString ? director : String(something(get(o, :main_category, nothing), "Movies & TV"))
-                year > 0 && (by *= " · " * feats[year])
-                (tv ? "TV" : "Film", by)
-            else
-                ("Fashion", "Clothing, Shoes & Jewelry")
-            end
-            meta[asin] = (kind, String(title), String(by), cats)
-        end
-    end
-    return meta
+    out
 end
 
 """
-Dense core: drop items saved by fewer than `min_item[d]` of the remaining people and people
-with fewer than `min_user[d]` saves in some layer, again and again until nothing changes.
-Fashion items almost never repeat across people, so its threshold has to be lower.
+Dense core over the three layers. Items with too few fans go, a person's layer goes if they saved
+too little there, and people left with fewer than two layers go. Repeats until nothing changes.
 """
-function dense_core!(lists, users; min_user, min_item)
-    for _ in 1:50
+function dense_core!(saves::Dict{Symbol,Dict{String,Set{String}}}; min_fans, min_user)
+    while true
         changed = false
-        for d in DOMAINS
-            cnt = Dict{String,Int}()
-            for u in users, i in lists[d][u]
-                cnt[i] = get(cnt, i, 0) + 1
+        for l in LAYERS
+            fans = Dict{String,Int}()
+            for s in values(saves[l]), k in s
+                fans[k] = get(fans, k, 0) + 1
             end
-            for u in users
-                before = length(lists[d][u])
-                filter!(i -> cnt[i] >= min_item[d], lists[d][u])
-                changed |= length(lists[d][u]) != before
+            for s in values(saves[l])
+                n0 = length(s)
+                filter!(k -> fans[k] >= min_fans[l], s)
+                changed |= length(s) != n0
+            end
+            for (u, s) in collect(saves[l])
+                length(s) < min_user[l] && (delete!(saves[l], u); changed = true)
             end
         end
-        keep = filter(u -> all(length(lists[d][u]) >= min_user[d] for d in DOMAINS), users)
-        changed |= length(keep) != length(users)
-        users = keep
-        changed || break
+        layers = Dict{String,Int}()
+        for l in LAYERS, u in keys(saves[l])
+            layers[u] = get(layers, u, 0) + 1
+        end
+        for l in LAYERS, u in collect(keys(saves[l]))
+            layers[u] < 2 && (delete!(saves[l], u); changed = true)
+        end
+        changed || return saves
     end
-    return users
 end
 
-"""
-    load_amazon(raw_dir; min_rating = 4, min_user = (music=2, visual=2, film=4),
-                min_item = (music=4, visual=3, film=4), min_tag = 30, max_users = 0, seed = 1) -> Dataset
-"""
-function load_amazon(raw_dir::AbstractString; min_rating = 4.0, min_user = (music = 2, visual = 2, film = 4),
-                     min_item = (music = 4, visual = 3, film = 4), min_tag = 30, max_users = 0, seed = 1,
-                     val = 0.1, test = 0.1, log = println)
-    rng = MersenneTwister(seed)
-    saved = Dict(d => read_ratings(joinpath(raw_dir, AMAZON_FILES[d][1]); min_rating) for d in DOMAINS)
-    users = sort!(collect(intersect((Set(keys(saved[d])) for d in DOMAINS)...)))
-    log("people with 4-5 star ratings in all three layers: $(length(users))")
-    lists = Dict(d => Dict(u => unique(saved[d][u]) for u in users) for d in DOMAINS)
-    users = dense_core!(lists, users; min_user, min_item)
-    if max_users > 0 && length(users) > max_users
-        users = sort!(users[randperm(rng, length(users))[1:max_users]])
-    end
-    log("after the dense core: $(length(users)) people")
+"which tags can be chips in the app: main music genres, film genres, style product types"
+chip_kind(l::Symbol, styletypes) = l == :music ? (t -> t in MUSIC_GENRES) :
+    l == :film ? (t -> t in values(FILM_GENRE) && !(t in FILM_SKIP)) : (t -> t in styletypes && !(t in STYLE_GROUPS))
 
-    items = Dict{Symbol,Vector{Item}}()
-    inter = Dict{Symbol,Vector{Vector{Int}}}()
-    tagcount = Dict{String,Int}()
-    rawtags = Dict{Symbol,Dict{String,Vector{String}}}()
-    for d in DOMAINS
-        cnt = Dict{String,Int}()
-        for u in users, i in lists[d][u]
-            cnt[i] = get(cnt, i, 0) + 1
+"""
+    load_amazon(raw_dir; ...) -> Dataset
+
+Builds the dataset from the files scripts/fetch_amazon.sh made. `max_cold` caps the search-only
+items per layer (the most rated on Amazon are kept).
+"""
+function load_amazon(raw_dir::AbstractString; min_rating = 4.0, min_fans = (music = 10, film = 12, style = 10),
+                     min_user = (music = 2, film = 3, style = 2), max_cold = 10_000, min_tag = 3, seed = 7, log = stdout)
+    prods, ents, saves = Dict{Symbol,Dict{String,Product}}(), Dict{Symbol,Dict{String,Entity}}(), Dict{Symbol,Dict{String,Set{String}}}()
+    for l in LAYERS
+        ratings, meta = AMAZON_FILES[l]
+        prods[l] = read_products(joinpath(raw_dir, meta), l)
+        ents[l] = entities(prods[l])
+        saves[l] = read_saves(joinpath(raw_dir, ratings), prods[l]; min_rating)
+        println(log, "$l: $(length(prods[l])) products become $(length(ents[l])) entities, ",
+                "$(sum(length, values(saves[l]); init = 0)) saves by $(length(saves[l])) people")
+    end
+    dense_core!(saves; min_fans, min_user)
+    users = sort(unique(reduce(vcat, [collect(keys(saves[l])) for l in LAYERS])))
+    uidx = Dict(u => i for (i, u) in enumerate(users))
+    styletypes = Set(p.tags[1] for p in values(prods[:style]) if !isempty(p.tags))
+
+    items, cold, tags, chips, inter = Dict{Symbol,Vector{Item}}(), Dict{Symbol,Vector{Item}}(), Dict{Symbol,Vector{String}}(),
+        Dict{Symbol,Vector{Int}}(), Dict{Symbol,Vector{Vector{Int}}}()
+    for l in LAYERS
+        fans = Dict{String,Int}()
+        for s in values(saves[l]), k in s
+            fans[k] = get(fans, k, 0) + 1
         end
-        ids = sort!(collect(keys(cnt)); by = i -> (-cnt[i], i))
-        meta = read_meta(joinpath(raw_dir, AMAZON_FILES[d][2]), d)
-        rawtags[d] = Dict{String,Vector{String}}()
-        list = Item[]
-        for a in ids
-            kind, title, by, cats = get(meta, a, (d == :film ? "Film" : d == :music ? "Album" : "Fashion", "", "", String[]))
-            tags = unique(string(d, "/", clean_tag(c)) for c in cats if !is_noise(c))
-            rawtags[d][a] = tags
-            for t in tags
-                tagcount[t] = get(tagcount, t, 0) + 1
+        graph = sort(collect(keys(fans)); by = k -> (-fans[k], k))
+        ingraph = Set(graph)
+        rest = [e for e in values(ents[l]) if !(e.key in ingraph) && !isempty(entity_tags(e))]
+        sort!(rest; by = e -> (-e.amazon, e.key))
+        rest = rest[1:min(end, max_cold)]
+
+        # tags used by enough entities, plus brand names that cover more than one style item
+        etags = Dict(e.key => entity_tags(e) for e in [[ents[l][k] for k in graph]; rest])
+        if l == :style
+            brands = Dict{String,Int}()
+            for k in graph
+                b = display_name(ents[l][k].names)
+                brands[b] = get(brands, b, 0) + 1
             end
-            push!(list, Item(a, d, kind, isempty(title) ? "Untitled ($a)" : title, by, String[]))
+            for (k, t) in etags
+                b = display_name(ents[l][k].names)
+                get(brands, b, 0) >= 2 && push!(t, b)
+            end
         end
-        items[d] = list
-        pos = Dict(a => k for (k, a) in enumerate(ids))
-        inter[d] = [sort!([pos[i] for i in lists[d][u]]) for u in users]
+        tcount = Dict{String,Int}()
+        for t in values(etags), x in t
+            tcount[x] = get(tcount, x, 0) + 1
+        end
+        vocab = sort([t for (t, c) in tcount if c >= min_tag]; by = t -> (-tcount[t], t))
+        tid = Dict(t => i for (i, t) in enumerate(vocab))
+        tags[l] = vocab
+        ischip = chip_kind(l, styletypes)
+        chips[l] = [tid[t] for t in vocab if ischip(t)][1:min(end, 24)]
+
+        taken = Set{String}()
+        function make(e::Entity)
+            name = display_name(e.names)
+            base = l == :style ? slugify(string(name, " ", top(e.subs))) : slugify(name)
+            isempty(base) && (base = "item")
+            id, k = base, 1
+            while id in taken
+                k += 1
+                id = "$base-$k"
+            end
+            push!(taken, id)
+            et = etags[e.key]
+            Item(id, name, entity_sub(l, e, et), entity_info(l, e), top(e.kinds), [tid[t] for t in et if haskey(tid, t)], e.img, e.amazon)
+        end
+        items[l] = [make(ents[l][k]) for k in graph]
+        cold[l] = [make(e) for e in rest]
+        kidx = Dict(k => i for (i, k) in enumerate(graph))
+        lists = [Int[] for _ in users]
+        for (u, s) in saves[l]
+            lists[uidx[u]] = sort([kidx[k] for k in s])
+        end
+        inter[l] = lists
     end
-    tags = sort!([t for (t, c) in tagcount if c >= min_tag])
-    keep = Set(tags)
-    for d in DOMAINS
-        items[d] = [Item(it.id, it.domain, it.kind, it.title, it.by, filter(in(keep), rawtags[d][it.id])) for it in items[d]]
-    end
-    parts = random_split(length(users), rng; val, test)
-    return Dataset("amazon", items, tags, users, inter, parts)
+    split = random_split(length(users), MersenneTwister(seed))
+    ds = Dataset("amazon", items, cold, tags, chips, users, inter, split)
+    print(log, summary_string(ds))
+    ds
 end

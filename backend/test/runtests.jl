@@ -1,153 +1,130 @@
 # Run with:  julia --project=backend backend/test/runtests.jl
-using Test, Umix, SparseArrays, Random, Zygote, JSON3
-import HTTP
-const U = Umix
-const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
-const CATALOG = joinpath(ROOT, "data", "catalog")
+using Test, Random, SparseArrays, Statistics, JSON3, Lux, Optimisers, ADTypes, Enzyme
+include("tiny.jl")     # Umix as U, and tiny_dataset()
+
+rec(s) = JSON3.read(s)
 
 @testset "um!x backend" begin
-    ds, truth = make_synthetic(CATALOG; cfg = SynthConfig(n_maps = 400, seed = 3))
+    ds = tiny_dataset()
 
-    @testset "catalogue and synthetic data" begin
-        items = load_catalog(CATALOG)
-        ids = [it.id for d in DOMAINS for it in items[d]]
-        @test length(ids) == length(unique(ids))
-        @test all(it -> !isempty(it.tags), vcat(values(items)...))
-        @test length(ds.users) == 400
+    @testset "dataset" begin
+        @test all(length(U.layers_of(ds, u)) >= 2 for u in 1:U.nusers(ds))
         @test Set(ds.split) == Set([:train, :val, :test])
-        for d in DOMAINS
-            @test all(l -> issorted(l) && allunique(l) && all(1 .<= l .<= U.nitems(ds, d)), ds.inter[d])
+        for l in LAYERS
+            @test all(v -> issorted(v) && allunique(v) && all(1 .<= v .<= U.nitems(ds, l)), ds.inter[l])
         end
-        @test length(truth.map_scene) == 400
+        path = tempname() * ".json"
+        U.save_dataset(path, ds)
+        ds2 = U.load_dataset(path)
+        @test ds2.users == ds.users && ds2.split == ds.split && ds2.chips == ds.chips
+        @test all(ds2.inter[l] == ds.inter[l] && [x.id for x in ds2.items[l]] == [x.id for x in ds.items[l]] for l in LAYERS)
     end
 
-    @testset "saving and loading a dataset" begin
-        path = tempname() * ".json"
-        save_dataset(path, ds)
-        ds2 = load_dataset(path)
-        @test ds2.users == ds.users && ds2.split == ds.split && ds2.tags == ds.tags
-        @test all(ds2.inter[d] == ds.inter[d] for d in DOMAINS)
-        @test [it.id for it in ds2.items[:film]] == [it.id for it in ds.items[:film]]
+    @testset "Amazon records become artists, titles and brand + type" begin
+        p = U.music_product(rec("""{"a":"A1","t":"1989 [Vinyl]","s":"Taylor Swift  (Artist)    Format: Vinyl","c":["CDs & Vinyl","Pop","Today's Deals in Music"],"n":10,"i":"x1","o":true}"""))
+        @test p.key == "taylor swift" && p.name == "Taylor Swift" && p.tags == ["Pop"] && p.extra == "1989"
+        @test U.music_product(rec("""{"a":"A2","s":"Barry, John  (Composer),     Trevor, Kirk  (Conductor)    Format: Audio CD","c":["CDs & Vinyl","Soundtracks"],"n":1}""")).name == "John Barry"
+        @test U.music_product(rec("""{"a":"A3","s":"Various Artists  (Artist)    Format: Audio CD","c":["CDs & Vinyl","Pop"],"n":1}""")) === nothing
+        @test U.display_name(Dict("BTS" => 3, "Bts" => 1)) == "BTS"
+        @test U.display_name(Dict("KATHY MCCARTY" => 3)) == "Kathy Mccarty"
+        f = U.film_product(rec("""{"a":"F1","t":"Friends: Season 8 [DVD]","c":["Movies & TV","TV"],"d":{"Genre":"Comedy/Television"},"n":5}"""))
+        @test f.name == "Friends" && f.kind == "Series" && f.tags == ["Comedy"]
+        f2 = U.film_product(rec("""{"a":"F2","t":"Inception (Blu-ray)","c":["Movies & TV"],"d":{"Genre":"Action & Adventure","Director":"Christopher Nolan"},"n":5}"""))
+        @test f2.key == U.film_product(rec("""{"a":"F3","t":"Inception [DVD]","c":[],"d":{},"n":1}""")).key && f2.kind == "Film"
+        @test U.film_product(rec("""{"a":"F4","t":"Yoga for Beginners","c":[],"d":{"Genre":"Exercise & Fitness"},"n":1}""")) === nothing
+        s = U.style_product(rec("""{"a":"S1","t":"Dr. Martens Women's 1460 Boot","s":"Dr. Martens","c":["Clothing, Shoes & Jewelry","Women","Shoes","Boots","Ankle & Bootie"],"n":9}"""))
+        @test s.key == "dr martens|w|boots" && s.sub == "Women’s boots" && "Boots" in s.tags
+        @test U.style_product(rec("""{"a":"S2","s":"Carter's","c":["Clothing, Shoes & Jewelry","Baby","Baby Girls","Clothing"],"n":9}""")) === nothing
+        # products of one entity add up
+        E = U.entities(Dict(x.asin => x for x in [p, U.music_product(rec("""{"a":"A4","t":"Red","s":"Taylor Swift    Format: Audio CD","c":["CDs & Vinyl","Country"],"n":50,"i":"x2"}"""))]))
+        e = E["taylor swift"]
+        @test e.products == 2 && e.img == "x2" && Set(U.entity_tags(e)) == Set(["Pop", "Country"])
     end
 
     @testset "graph normalization" begin
-        users = users_in(ds, :train)[1:50]
+        users = U.users_in(ds, :train)
         g = U.build_graph(ds, users)
-        R = U.interaction_matrix(ds, :music, users)
+        R = U.interaction_matrix(ds, :film, users)
         du, di = vec(sum(R; dims = 2)), vec(sum(R; dims = 1))
-        I, J, V = findnz(g.A.music)
+        I, J, V = findnz(g.A.film)
         @test all(isapprox(V[k], 1 / sqrt(du[I[k]] * di[J[k]]); rtol = 1e-5) for k in eachindex(V))
-        @test g.At.music == sparse(transpose(g.A.music))
+        @test g.At.film == sparse(transpose(g.A.film))
     end
 
-    @testset "gradients match finite differences" begin
-        rng = MersenneTwister(1)
-        cfg = ModelConfig(dim = 8, hops = 2)
-        θ = U.init_params(rng, ds, cfg)
-        X = U.tag_features(ds)
-        tr = users_in(ds, :train)
-        g = U.build_graph(ds, tr[1:200])
-        b = tr[201:232]
-        M, mask = U.source_input(ds, b)
-        Y = U.target_matrix(ds, b)
-        f(p) = U.batch_loss(p, X, g, M, mask, Y, cfg)
-        gr = Zygote.gradient(f, θ)[1]
-        for (name, idx) in ((:E_music, (3, 2)), (:E_film, (5, 4)), (:T, (2, 1)), (:Wa, (1, 1)), (:W1, (2, 3)), (:β, (2,)))
-            p = getfield(θ, name)
-            old = p[idx...]
-            h = 1f-2
-            p[idx...] = old + h; up = f(θ)
-            p[idx...] = old - h; dn = f(θ)
-            p[idx...] = old
-            @test isapprox(getfield(gr, name)[idx...], (up - dn) / (2h); atol = 2e-3, rtol = 5e-2)
+    @testset "Enzyme gradients match finite differences" begin
+        net = U.UmixNet(ds, U.ModelConfig(dim = 4, hops = 1, att_hidden = 3))
+        ps, st = Lux.setup(Xoshiro(1), net)
+        g = U.build_graph(ds, U.users_in(ds, :train)[1:300])
+        rng = Xoshiro(2)
+        sub(l) = U.make_sub(net, ds, [U.person_case(ds, u, l, rng; tagonly = 0.3) for u in U.users_in(ds, :val) if !isempty(ds.inter[l][u])][1:12], l)
+        x = (graph = g, music = sub(:music), film = sub(:film), style = sub(:style))
+        ts = Lux.Training.TrainState(net, ps, st, Descent(0.0))
+        grads, loss, _, _ = Lux.Training.compute_gradients(AutoEnzyme(), U.batch_loss, x, ts)
+        f(p) = Float64(U.batch_loss(net, p, st, x)[1])
+        @test loss ≈ f(ps)
+        h = 1f-2
+        for (get, k) in ((p -> p.E.music, 3), (p -> p.G.style, 2), (p -> p.att.W, 4), (p -> p.heads.film.W1, 5),
+                         (p -> p.bias.style, 1), (p -> p.β, 2), (p -> p.att.q, 1))
+            p1, p2 = deepcopy(ps), deepcopy(ps)
+            get(p1)[k] += h
+            get(p2)[k] -= h
+            @test isapprox(get(grads)[k], (f(p1) - f(p2)) / 2h; rtol = 0.05, atol = 2e-3)
         end
     end
 
-    @testset "ranking metrics" begin
-        S = [0.9 0.1 0.8 0.2; 0.1 0.2 0.3 0.4]
-        m = ranking_metrics(S, [[1, 3], [2]]; ks = (2,))
-        # user 1 gets both films in the top 2, user 2 has film 2 ranked 3rd
-        @test m["recall@2"] ≈ 0.5
-        @test m["hit@2"] ≈ 0.5
-        @test m["ndcg@2"] ≈ 0.5
+    m = U.train(ds, U.ModelConfig(dim = 16, hops = 2, att_hidden = 8), U.TrainConfig(epochs = 8, batch = 128, lr = 0.02); log = devnull)
+
+    @testset "training learns more than popularity" begin
+        res = U.evaluate_all(ds, [U.ScorePopular(ds), U.ScoreKNN(ds), U.ScoreModel(m)])
+        ours = mean(U.mean_metric(res[t], m.name, "ndcg@10") for t in LAYERS)
+        pop = mean(U.mean_metric(res[t], "Popularity", "ndcg@10") for t in LAYERS)
+        @test ours > pop + 0.1
+        p = U.paired(res[:style], m.name, "Popularity")
+        @test p.lo <= p.diff <= p.hi && p.n == length(res[:style].cases)
     end
 
-    model = train(ds, ModelConfig(dim = 16, hops = 2),
-                  TrainConfig(epochs = 40, eval_every = 4, patience = 3, lr = 0.02); log = x -> nothing)
-
-    @testset "the model learns something" begin
-        va = users_in(ds, :val)
-        pop = evaluate(ScorePopular(ds), ds, va)
-        gcn = evaluate(ScoreModel(model), ds, va)
-        @test gcn["ndcg@10"] > pop["ndcg@10"]
-        w = U.layer_weights(model.θ)
-        @test sum(w) ≈ 3 atol = 1e-4
-    end
-
-    @testset "export round trip gives the same picks" begin
-        path = tempname() * ".json"
-        export_model(path, model; dataset = "test")
-        em = load_exported(path)
-        idx = U.item_index(ds)
-        for u in users_in(ds, :test)[1:20]
-            ids = [ds.items[:music][i].id for i in ds.inter[:music][u]]
-            append!(ids, [ds.items[:visual][i].id for i in ds.inter[:visual][u]])
-            S, _ = U.score_users(model, [ds.inter[:music][u]], [ds.inter[:visual][u]])
-            want = [ds.items[:film][f].id for f in sortperm(vec(S); rev = true)[1:5]]
-            got = [r["id"] for r in recommend(em, ids; k = 5)["recs"]]
-            @test got == want
+    @testset "export round trip ranks like the trained model" begin
+        dir = mktempdir()
+        U.export_model(dir, m, ds)
+        em = U.load_exported(dir)
+        @test sort(readdir(dir)) == ["film.json", "manifest.json", "music.json", "search.json", "style.json", "vectors.bin"]
+        Z = U.item_vectors(m)
+        for t in LAYERS, c in U.hidden_layer_cases(ds, U.users_in(ds, :test), t)[1:5]
+            S = vec(U.sub_scores(m.net, m.ps, Z, U.make_sub(m.net, ds, [(c.given, c.hidden)], t), t))
+            picks, w = U.recommend(em, Dict(l => [(:graph, i) for (i, _) in v] for (l, v) in c.given), t; k = 5)
+            @test [p.i for p in picks][1:3] == partialsortperm(S, 1:3; rev = true)
+            @test sum(values(w)) ≈ 1 && w[t] == 0
+            @test all(p -> p.because !== nothing && haskey(c.given, p.because[1]), picks) || sum(length, values(c.given)) == 1
         end
-        # an empty map still gets picks (popular ones) and no explanation
-        out = recommend(em, String[]; k = 3)
-        @test length(out["recs"]) == 3 && all(r -> r["because"] === nothing, out["recs"])
-        # films on the map and excluded ids never come back
-        out = recommend(em, ["pw", "sun", "lll"]; k = 74, exclude = ["bsr"])
-        @test !any(r -> r["id"] in ("lll", "bsr"), out["recs"])
-        @test all(r -> r["because"] in ("pw", "sun"), out["recs"])
-    end
-
-    @testset "HTTP handler" begin
-        path = tempname() * ".json"
-        export_model(path, model; dataset = "test")
-        em = load_exported(path)
-        r = U.handle(em, HTTP.Request("GET", "/api/health"), nothing)
-        @test r.status == 200
-        @test JSON3.read(String(r.body)).ok == true
-        body = JSON3.write(Dict("items" => ["pw", "sun"], "k" => 4))
-        r = U.handle(em, HTTP.Request("POST", "/api/recommend"; body = body), nothing)
-        o = JSON3.read(String(r.body))
-        @test r.status == 200 && length(o.recs) == 4 && o.engine == "julia"
-        r = U.handle(em, HTTP.Request("GET", "/api/recommend"), nothing)
-        @test r.status == 405
-        r = U.handle(em, HTTP.Request("GET", "/../secret"), joinpath(ROOT, "frontend"))
-        @test r.status == 404
+        # a genre chip on its own still gives picks
+        picks, _ = U.recommend(em, Dict(:music => [(:tags, [1])]), :film; k = 3)
+        @test length(picks) == 3
     end
 
     @testset "user test report" begin
-        ev(tester, t, action, film, rank; from = "map") =
-            Dict("device" => "aaaa", "tester" => tester, "t" => t, "action" => action, "from" => from, "film" => film,
-                 "title" => film, "rank" => rank, "of" => 10)
-        # P1 kept their top picks and skipped a low one, P2 did the opposite,
+        ev(tester, t, action, layer, id, rank; from = "discover") = Dict("device" => "aaaa", "tester" => tester, "t" => t, "action" => action,
+            "from" => from, "layer" => layer, "id" => id, "name" => id, "rank" => rank, "of" => 10)
+        # P1 kept top picks and skipped a low one in style, P2 did the opposite in film,
         # P3 kept something and then removed it, so P3 has no keeps left to compare
-        events = [ev("P1", "1", "keep", "A", 1), ev("P1", "2", "skip", "B", 8; from = "outside"), ev("P1", "3", "keep", "C", 3),
-                  ev("P2", "4", "keep", "D", 9; from = "search"), ev("P2", "5", "skip", "E", 2),
-                  ev("P3", "6", "keep", "F", 4), ev("P3", "7", "remove", "F", nothing)]
+        events = [ev("P1", "1", "keep", "style", "A", 1), ev("P1", "2", "skip", "style", "B", 8; from = "discover/style"),
+                  ev("P1", "3", "keep", "style", "C", 3), ev("P2", "4", "keep", "film", "D", 9; from = "item"),
+                  ev("P2", "5", "skip", "film", "E", 2), ev("P3", "6", "keep", "music", "F", 4), ev("P3", "7", "remove", "music", "F", nothing; from = "me")]
         dir = mktempdir()
-        write(joinpath(dir, "one.json"), JSON3.write(Dict("format" => "umix-user-test/1", "events" => events)))
-        # a second export from the same device repeats P1's answers, they must count once
-        write(joinpath(dir, "two.json"), JSON3.write(Dict("format" => "umix-user-test/1", "events" => events[1:3])))
-        answers = load_user_test([dir])
+        write(joinpath(dir, "one.json"), JSON3.write(Dict("format" => "umix-user-test/2", "events" => events)))
+        write(joinpath(dir, "two.json"), JSON3.write(Dict("format" => "umix-user-test/2", "events" => events[1:3])))
+        answers = U.load_user_test([dir])
         @test length(answers) == 7
-        s = user_test_summary(answers)
+        s = U.user_test_summary(answers)
         @test s.people == 3 && s.scored == 2
-        @test s.pair ≈ 0.5            # P1 scores 1.0, P2 scores 0.0
+        @test s.pair.mean ≈ 0.5            # P1 style scores 1.0, P2 film scores 0.0
+        @test s.by_layer["style"].pair.mean ≈ 1.0 && s.by_layer["film"].pair.mean ≈ 0.0
         @test s.kept == 3 && s.skipped == 3 && s.removed == 1
         @test s.top3 == 3 && s.top3_kept == 2   # A and C kept, E skipped
-        @test s.byfrom["map"] == (2, 2) && s.byfrom["outside"] == (0, 1)
-        @test occursin("50% of the time", user_test_report(answers))
-        @test occursin("No answers yet", user_test_report(UserAnswer[]))
+        @test s.layers["style"] == (2, 1) && s.pages["me"] == (0, 1)
+        @test occursin("50% of the time", U.user_test_report(answers))
+        @test occursin("No answers yet", U.user_test_report(U.UserAnswer[]))
         bad = joinpath(dir, "bad.json")
         write(bad, "{\"events\": []}")
-        @test_throws ErrorException load_user_test([bad])
+        @test_throws ErrorException U.load_user_test([bad])
     end
 end

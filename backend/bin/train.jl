@@ -1,80 +1,84 @@
-# Train the multi-layer GCN, run the hidden-film test against the baselines, export.
-#   julia --project=backend backend/bin/train.jl synthetic [--dim 32] [--hops 2] [--epochs 60] [--ablations]
-#   julia --project=backend backend/bin/train.jl amazon --dim 64 --epochs 30 --ablations
-# Writes results/<data>_report.md, results/<data>_metrics.json and models/<data>.json.
-# The synthetic model also gets copied into the apps, frontend/model/ and webpage/public/model/.
+# Trains the model, runs the hidden-layer test against the baselines, writes the report, and
+# exports the files the website runs in the browser.
+#   julia --project=backend backend/bin/train.jl [--dim 64] [--hops 2] [--epochs 30] [--lr 0.005]
+#        [--batch 1024] [--backend enzyme|mooncake] [--ablations]
+# Writes results/amazon_report.md, results/amazon_metrics.json, results/amazon_train.log and
+# webpage/public/model/.
 include("cli.jl")
-using Umix, JSON3, Printf, Dates
+using Umix, Printf, JSON3, Dates, Statistics
 
-opts, pos = parse_args(ARGS)
-data = isempty(pos) ? "synthetic" : pos[1]
-ds = load_dataset(joinpath(ROOT, "data", "processed", "$data.json"))
-print(summary_string(ds))
+opts, _ = parse_args(ARGS)
+ds = load_dataset(joinpath(ROOT, "data", "processed", "amazon.jls"))
+mcfg = ModelConfig(dim = argint(opts, "dim", 64), hops = argint(opts, "hops", 2), att_hidden = argint(opts, "att", 32))
+tcfg = TrainConfig(epochs = argint(opts, "epochs", 30), lr = argfloat(opts, "lr", 0.005), batch = argint(opts, "batch", 1024),
+                   weight_decay = argfloat(opts, "wd", 1e-4), patience = argint(opts, "patience", 3),
+                   backend = Symbol(get(opts, "backend", "enzyme")), seed = argint(opts, "seed", 1))
+mkpath(joinpath(ROOT, "results"))
+logf = open(joinpath(ROOT, "results", "amazon_train.log"), "w")
+log = Tee(stdout, logf)
+print(log, summary_string(ds))
 
-mcfg = ModelConfig(dim = argint(opts, "dim", 32), hops = argint(opts, "hops", 2),
-                   fusion = Symbol(get(opts, "fusion", "attention")), use_tags = !argflag(opts, "no-tags"))
-tcfg = TrainConfig(epochs = argint(opts, "epochs", 150), lr = argfloat(opts, "lr", 0.02),
-                   batch = argint(opts, "batch", 256), weight_decay = argfloat(opts, "wd", 3e-3),
-                   item_drop = argfloat(opts, "drop", 0.3), patience = argint(opts, "patience", 6),
-                   eval_every = argint(opts, "eval-every", 5), pop_init = !argflag(opts, "no-pop-init"),
-                   seed = argint(opts, "seed", 1))
-
-println("\ntraining the multi-layer GCN  ", mcfg)
 t0 = time()
-model = train(ds, mcfg, tcfg; name = "Multi-layer GCN (ours)")
-train_secs = time() - t0
-scorers = Any[ScorePopular(ds), ScoreTags(ds), ScoreItemKNN(ds)]
-ablations = []
+model = train(ds, mcfg, tcfg; log)
+secs = time() - t0
+scorers = Any[ScorePopular(ds), ScoreKNN(ds)]
 if argflag(opts, "ablations")
-    for (nm, c) in [("  ablation, no graph (hops = 0)", ModelConfig(mcfg.dim, 0, mcfg.fusion, mcfg.use_tags, mcfg.att_hidden)),
-                    ("  ablation, mean instead of attention", ModelConfig(mcfg.dim, mcfg.hops, :mean, mcfg.use_tags, mcfg.att_hidden))]
-        println("\ntraining", nm)
-        push!(ablations, train(ds, c, tcfg; name = strip(nm)))
-    end
+    short = TrainConfig(tcfg.epochs, tcfg.lr, tcfg.weight_decay, tcfg.batch, tcfg.folds, tcfg.warm, tcfg.drop, tcfg.tagonly,
+                        tcfg.eval_every, tcfg.patience, tcfg.val_people, tcfg.seed, tcfg.backend)
+    push!(scorers, ScoreModel(train(ds, ModelConfig(mcfg.dim, 0, mcfg.att_hidden, true), short; name = "No graph (hops = 0)", log)))
+    push!(scorers, ScoreModel(train(ds, ModelConfig(mcfg.dim, mcfg.hops, mcfg.att_hidden, false), short; name = "Tags only (no item vectors)", log)))
 end
 push!(scorers, ScoreModel(model))
-append!(scorers, ScoreModel.(ablations))
+res = evaluate_all(ds, scorers)
+labels = [Umix.label(s) for s in scorers]
+ours = model.name
 
-println("\nhidden-film test on $(length(users_in(ds, :test))) test users")
-rows = evaluate_all(ds, scorers)
-table = metrics_table(rows)
-println(table)
-# paired check on the same test users, is the gap bigger than the noise?
-te = users_in(ds, :test)
-paired = [Umix.paired_difference(scorers[end - length(ablations)], s, ds, te) for s in scorers if s !== scorers[end - length(ablations)]]
-pair_lines = [@sprintf("* vs %s, NDCG@10 difference %+.4f (95%% CI %+.4f to %+.4f)", p["b"], p["diff"], p["lo"], p["hi"]) for p in paired]
-foreach(println, pair_lines)
-
-mkpath(joinpath(ROOT, "results"))
-summary = Dict("data" => data, "date" => string(Dates.today()), "config" => string(mcfg), "train" => string(tcfg),
-               "train_seconds" => round(train_secs; digits = 1), "rows" => rows, "paired" => paired,
-               "layer_weights" => Umix.layer_weights(model.θ), "history" => model.history)
-open(io -> JSON3.write(io, summary), joinpath(ROOT, "results", "$(data)_metrics.json"), "w")
-open(joinpath(ROOT, "results", "$(data)_report.md"), "w") do io
-    println(io, "# Hidden-film test, $data data\n")
-    println(io, "Run on $(Dates.today()) with $(length(users_in(ds, :test))) test users. Each one only shows their music and visual saves, and we check where their real films land.\n")
-    println(io, "```\n", summary_string(ds), "```\n")
-    println(io, table)
-    println(io, "\nPaired check for $(model.name) on the same test users (full maps). If the interval stays above zero, the gap is bigger than the noise.\n")
-    foreach(l -> println(io, l), pair_lines)
-    w = Umix.layer_weights(model.θ)
-    @printf(io, "\nLearned layer weights in the graph are music %.2f, visual %.2f and film %.2f (1.00 each would be equal)\n", w[1], w[2], w[3])
-    @printf(io, "\nTraining took %.0f seconds with %s\n", train_secs, string(mcfg))
-end
-
-# keep the test numbers inside the exported file so the app can show them
-best = rows[findfirst(r -> r["method"] == model.name, rows)]
-pop = rows[1]
-metrics = Dict("test_users" => best["full"]["users"], "recall@10" => best["full"]["recall@10"], "ndcg@10" => best["full"]["ndcg@10"],
-               "popularity_recall@10" => pop["full"]["recall@10"])
-path = export_model(joinpath(ROOT, "models", "$data.json"), model; dataset = data, metrics)
-println("exported $path")
-if data == "synthetic"
-    # the app model lives in two places, the plain app (frontend/) and the React site (webpage/)
-    for app in (joinpath(ROOT, "frontend", "model", "umix-model.json"), joinpath(ROOT, "webpage", "public", "model", "umix-model.json"))
-        isdir(dirname(dirname(app))) || continue
-        mkpath(dirname(app))
-        cp(path, app; force = true)
-        println("copied to $app")
+# ---------- report ----------
+names = Dict(:music => "music (CDs & Vinyl)", :film => "film and TV (Movies & TV)", :style => "style (Clothing, Shoes & Jewelry)")
+io = IOBuffer()
+ntest = length(users_in(ds, :test))
+println(io, "# Hidden-layer test, Amazon data\n")
+println(io, "Run on $(Dates.today()) with $ntest test people. For each layer a test person has, that whole layer is hidden. ",
+        "A method sees everything else they saved, ranks every item of the hidden layer, and we check where their hidden saves land. ",
+        "Numbers are NDCG@10, higher is better.\n")
+println(io, "```\n", summary_string(ds), "```")
+metrics = Dict{String,Any}("test_people" => ntest, "targets" => Dict{String,Any}())
+for t in LAYERS
+    r = res[t]
+    combos = sort(unique(c.combo for c in r.cases); by = c -> -count(x -> x.combo == c, r.cases))
+    println(io, "\n## Predicting $(names[t])\n")
+    println(io, "| given | cases | ", join(labels, " | "), " |")
+    println(io, "|---|---|", repeat("---|", length(labels)))
+    for c in [combos; nothing]
+        n = c === nothing ? length(r.cases) : count(x -> x.combo == c, r.cases)
+        row = [@sprintf("%.4f", mean_metric(r, lab, "ndcg@10"; combo = c)) for lab in labels]
+        println(io, "| ", c === nothing ? "**all**" : replace(c, "+" => " + "), " | $n | ", join(row, " | "), " |")
     end
+    println(io, "\nRecall@10 over all cases: ", join(["$lab $(@sprintf("%.4f", mean_metric(r, lab, "recall@10")))" for lab in labels], ", "), ".\n")
+    println(io, "Paired check of $ours on the same cases, NDCG@10 difference with a 95% interval:\n")
+    for lab in labels
+        lab == ours && continue
+        p = paired(r, ours, lab)
+        @printf(io, "* vs %s, %+.4f (%+.4f to %+.4f)\n", lab, p.diff, p.lo, p.hi)
+    end
+    metrics["targets"][string(t)] = Dict{String,Any}(lab => Dict("ndcg@10" => mean_metric(r, lab, "ndcg@10"), "recall@10" => mean_metric(r, lab, "recall@10"),
+                                                              "hit@10" => mean_metric(r, lab, "hit@10")) for lab in labels)
+    metrics["targets"][string(t)]["cases"] = length(r.cases)
 end
+w = Umix.layer_weights(model.ps)
+@printf(io, "\nLearned layer weights in message passing: music %.2f, film %.2f, style %.2f (1.00 each would be equal).\n", w...)
+@printf(io, "\nTraining took %.0f seconds with %s and %s. Best epoch %d.\n", secs, string(mcfg), string(tcfg.backend), model.epoch)
+report = String(take!(io))
+write(joinpath(ROOT, "results", "amazon_report.md"), report)
+print(log, report)
+open(io -> JSON3.pretty(io, metrics), joinpath(ROOT, "results", "amazon_metrics.json"), "w")
+
+# ---------- website files ----------
+stats = Dict("people" => length(ds.users), "saves" => Dict(string(l) => sum(length, ds.inter[l]) for l in LAYERS),
+             "items" => Dict(string(l) => nitems(ds, l) for l in LAYERS))
+headline = Dict(string(t) => Dict("ours" => metrics["targets"][string(t)][ours]["ndcg@10"],
+                                  "popularity" => metrics["targets"][string(t)]["Popularity"]["ndcg@10"],
+                                  "cases" => metrics["targets"][string(t)]["cases"]) for t in LAYERS)
+path = export_model(joinpath(ROOT, "webpage", "public", "model"), model, ds; metrics = headline, stats)
+println(log, "exported $path")
+close(logf)
