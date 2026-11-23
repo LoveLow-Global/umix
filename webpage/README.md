@@ -25,6 +25,7 @@ Then open http://localhost:5173.
 | `/me` | your info and everything you gave us |
 | `/about` | how the data and model work |
 | `/test` | for the user test facilitator, not linked in the app |
+| `/proto/` | the phone prototype (`proto/`). Its screens are the design mock; making a map and the map's suggestions run on the real model (`proto/real.js`). Keeps and skips go to the same test log as `/test` |
 
 ## Edit content
 
