@@ -2,6 +2,7 @@
 data/raw/
 data/processed/
 results/*.log
+results/*.out
 
 # raw user test answers from testers, share them directly instead of through git
 results/user_test/

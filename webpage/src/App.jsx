@@ -59,7 +59,7 @@ function Shell() {
           <NavLink to="/me">{I.user}You</NavLink>
         </nav>
       )}
-      {!onboarding && <footer className="footer"><div className="inner"><span>um!x · IID2019, Yonsei</span><Link to="/about">How it works</Link><span>Data: Amazon Reviews 2023</span></div></footer>}
+      {!onboarding && <footer className="footer"><div className="inner"><span>um!x · Yonsei</span><Link to="/about">How it works</Link><span>Data: Amazon Reviews 2023</span></div></footer>}
       <Toast toast={s.ui.toast} />
     </div>
   )

@@ -56,7 +56,7 @@ function TasteMap({ m, s }) {
       {links.map(l => <path key={l.key} d={`M${l.a.x},${l.a.y} L${l.b.x},${l.b.y}`} stroke={l.mine ? 'var(--line)' : COLOR[l.L]}
         strokeOpacity={l.mine ? 1 : .6} strokeWidth={l.mine ? 1.5 : 1.3} strokeDasharray={l.mine ? undefined : '3 5'} fill="none" />)}
       <circle cx={C.x} cy={C.y} r="30" fill="var(--text)" />
-      <text x={C.x} y={C.y + 5} textAnchor="middle" fill="#fff" fontWeight="700" fontSize="14">{short(s.profile.name || 'You', 8)}</text>
+      <text x={C.x} y={C.y + 5} textAnchor="middle" fill="var(--bg)" fontWeight="700" fontSize="14">{short(s.profile.name || 'You', 8)}</text>
       {nodes.map(n => {
         const L = n.it.layer, url = imageUrl(n.it.img, 160)
         return (

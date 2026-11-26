@@ -2,7 +2,7 @@
 
 um!x puts your music, films and style on one map. You tell it a few artists and films you love, and a graph neural network trained on real Amazon shoppers guesses the rest, like what you'd wear. Everything in it is real data, and the model runs in your browser.
 
-Class project for IID2019 Introduction to Social Computing (Yonsei, fall 2026), by Hyun Jun Cho, Jihyung Kim and Goeun Ju.
+Class project for Introduction to Social Computing (Yonsei, fall 2026), by Hyun Jun Cho, Jihyung Kim and Goeun Ju.
 
 ## Run the website
 

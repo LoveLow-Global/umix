@@ -15,7 +15,7 @@ export default function About() {
     <div className="stack-lg fade">
       <div className="stack">
         <h1>How um!x works</h1>
-        <p className="lead">A class project for IID2019 Introduction to Social Computing at Yonsei. It guesses what you’d like in one area of taste from the other two.</p>
+        <p className="lead">A class project for Introduction to Social Computing at Yonsei. It guesses what you’d like in one area of taste from the other two.</p>
       </div>
 
       <section className="stack">
